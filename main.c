@@ -80,18 +80,19 @@ typedef struct bw_stack_t {
 } BwStack;
 
 
-typedef enum entry_type_t {
-    ENTRY_TYPE_CFUNC,
-    ENTRY_TYPE_FORTH,
-} EntryType;
+uint16_t ENTRY_TYPE_FIRST = 0;
+uint16_t ENTRY_TYPE_CFUNC = 1;
+uint16_t ENTRY_TYPE_FORTH = 2;
 
 typedef struct entry_t {
-    enum entry_type_t   entry_type;
-    uint8_t*            prev;       // Used for stacking and pooling
-    Bw*                 bw_name;
+    uint16_t            entry_h;    // counter
+    uint16_t            entry_type;
+    struct entry_t*     prev;       // Used for stacking and pooling
+    uint8_t*            next;       // Points to next peri
+    Bw                  bw_name;
     union {
         void*           vp_cfunc;   // ENTRY_TYPE_CFUNC
-        Bw*             bw_fcode;   // ENTRY_TYPE_CFORTH
+        Bw              bw_forth;   // ENTRY_TYPE_CFORTH
     };
 } Entry; // Dictionary entries
 
@@ -174,6 +175,8 @@ typedef struct mill_t {
     TokenStack*         token_stack;
         // This is the algorithmic forth stack.
 } Mill;
+
+typedef void (*Cfunc)(Mill*);
 
 
 // ------------------------------------------------------------------------
@@ -740,40 +743,39 @@ bw_test()
             mu_assert(bw_size(bw) == 3, ".");
         }
 
-        { // bw_set simple
+        { // bw_set (simple) and bw_to_s
             char* s = "aaa bbb ccc";
             char* nail = s;
-            char* peri = s+9;
+            char* peri = s+strlen(s);
             bw_set(bw, nail, peri);
-            bw_debug(bw);
+            mu_assert(bw_equals_s(bw, s), ".");
 
             char buf[20];
             bw_to_s(bw, buf, 20);
-            printf("to string |%s|\n", buf);
+            mu_assert(bw_equals_s(bw, buf), ".");
         }
 
-        { // bw_set offset
+        { // bw_set (offset) and bw_to_s
             char* s = "aaa bbb ccc";
-            char* nail = s+4;
-            char* peri = s+9;
+            char* nail = s+4; // first b
+            char* peri = s+9; // first c
             bw_set(bw, nail, peri);
-            bw_debug(bw);
+            mu_assert(bw_equals_s(bw, "bbb c"), ".");
 
             char buf[20];
             bw_to_s(bw, buf, 20);
-            printf("to string |%s|\n", buf);
+            mu_assert(bw_equals_s(bw, buf), ".");
         }
 
         { // bw_from_s
             char* s = "aaa bbb ccc";
             bw_from_s(bw, s);
-            bw_debug(bw);
+            mu_assert(bw_equals_s(bw, s), ".");
 
             char buf[20];
             bw_to_s(bw, buf, 20);
-            printf("to string |%s|\n", buf);
+            mu_assert(bw_equals_s(bw, buf), ".");
         }
-
     }
     bw_del(bw);
 
@@ -1087,10 +1089,33 @@ token_stack_test()
 }
 
 
+// ------------------------------------------------------------------------
+//  cfunc
+// ------------------------------------------------------------------------
+void cfunc_first(Mill* self) {}
+
+void cfunc_dot_s(Mill* self) {
+    
+}
+
+void cfunc_dup(Mill* self) {
+    printf("xxx cfunc_dup\n");
+}
+
 
 // ------------------------------------------------------------------------
 //  mill
 // ------------------------------------------------------------------------
+//
+// xxx implement words as a default word in the dict. this will be the
+// bootstrap word.
+//
+void
+mill_input(Mill* self, Bw* bw);
+
+void
+mill_dict_register_cfunc(Mill* self, char* ename, Cfunc cfunc);
+
 static void
 __mill_init(Mill* self, size_t dict_size, size_t word_size,
         size_t fifo_in_size, size_t fifo_out_size) 
@@ -1107,8 +1132,19 @@ __mill_init(Mill* self, size_t dict_size, size_t word_size,
     self->b_quit = 0;
     self->b_echo = 1;
 
-    self->dict_mem = (uint64_t*) malloc(sizeof(uint64_t) * dict_size);
-    self->dict_top = self->dict_mem;
+    self->dict_mem = (uint8_t*) malloc(sizeof(uint8_t) * dict_size);
+    self->dict_top = self->dict_mem; {
+        // Populate the first entry into the dictionary.
+        Entry* entry = (Entry*) self->dict_mem;
+        entry->entry_h = 0;
+        entry->entry_type = ENTRY_TYPE_FIRST;
+        entry->prev = NULL;
+        entry->next = self->dict_mem + sizeof(Entry);
+        bw_init(&entry->bw_name);
+        entry->bw_name.nail = 0;
+        entry->bw_name.peri = 0;
+        entry->vp_cfunc = NULL;
+    }
 
     self->bb_buf_input = bb_new(word_size);
     self->bb_buf_output = bb_new(word_size);
@@ -1190,6 +1226,109 @@ void mill_debug(Mill* self)
         break;
     }
     printf("}\n");
+}
+
+Entry*
+mill_dict_get_next_entry(Mill* mill, uint16_t entry_type)
+{
+    Entry* old_top = (Entry*) mill->dict_top;
+
+    Entry* new_top = (Entry*) old_top->next;
+    new_top->entry_h = old_top->entry_h + 1;
+    new_top->entry_type = entry_type;
+    new_top->prev = old_top;
+
+    mill->dict_top = (uint8_t*) new_top;
+
+    return new_top;
+}
+
+void
+mill_dict_register_cfunc(Mill* self, char* ename, Cfunc cfunc)
+{
+    uint16_t entry_type = ENTRY_TYPE_CFUNC;
+    Entry* entry = mill_dict_get_next_entry(self, entry_type);
+
+    size_t len;
+    Bw* bw;
+
+    // The character data of the name comes after the entry struct in
+    // the dictionary's memory reservation.
+    char* next = (char*) entry + sizeof(Entry);
+    len = strlen(ename);
+    bw = &entry->bw_name;
+    bw->nail = next;
+    bw->peri = next + len;
+    for (int i=0; i<len; i++) {
+        *(entry->bw_name.nail + i) = ename[i];
+    }
+
+    // The link to the C function takes no extra memory from reservation.
+    next = bw->peri;
+    entry->vp_cfunc = cfunc;
+
+    entry->next = (uint8_t*) next;
+}
+
+void
+mill_dict_register_forth(Mill* self, char* ename, char* forth)
+{
+    uint16_t entry_type = ENTRY_TYPE_FORTH;
+    Entry* entry = mill_dict_get_next_entry(self, entry_type);
+
+    size_t len;
+    Bw* bw;
+
+    // The character data of the name comes after the entry struct in
+    // the dictionary's memory reservation.
+    char* next = (char*) entry + sizeof(Entry);
+    len = strlen(ename);
+    bw = &entry->bw_name;
+    bw->nail = next;
+    bw->peri = next + len;
+    for (int i=0; i<len; i++) {
+        *(entry->bw_name.nail + i) = ename[i];
+    }
+
+    // The forth code sits in dictionary memory after the name.
+    next = bw->peri;
+    len = strlen(forth);
+    bw = &entry->bw_forth;
+    bw->nail = next;
+    bw->peri = next + len;
+    for (int i=0; i<len; i++) {
+        *(entry->bw_forth.nail + i) = forth[i];
+    }
+
+    next = bw->peri;
+    entry->next = (uint8_t*) next;
+}
+
+void
+mill_dict_register_defaults(Mill* self) 
+{
+    Bw bw;
+    Cfunc cfunc;
+
+    cfunc = cfunc_dup;
+    mill_dict_register_cfunc(self, "dup", cfunc);
+
+    bw_from_s(&bw, ": double dup + ;");
+    mill_input(self, &bw);
+}
+
+Entry*
+mill_dict_search(Mill* self, Bw* bw)
+{
+    Entry* entry = (Entry*) self->dict_top;
+    while (entry->entry_type != ENTRY_TYPE_FIRST) {
+        if (bw_equals_bw(bw, &entry->bw_name))
+            return entry;
+
+        entry = entry->prev;
+    }
+
+    return NULL;
 }
 
 static void __mill_to_mode_weir(Mill* self) 
@@ -1290,24 +1429,9 @@ __mill_on_word(Mill* self, Bw* bw)
     }
 
     // Attempt to find it in the dictionary
-    Entry* entry = NULL; {
-        void* dict_ptr = self->dict_top;
-
-        uint8_t b_found = 0;
-        Bw* bw_name = NULL;
-        while (dict_ptr > self->dict_mem) {
-            entry = (Entry*) dict_ptr;
-
-            if (bw_equals_bw(bw, entry->bw_name)) {
-                b_found = 1;
-            }
-            else {
-                dict_ptr = entry->prev;
-            }
-            if (b_found) break;
-        }
-
-        if (!b_found) entry = NULL;
+    Entry* entry = mill_dict_search(self, bw);
+    if (entry != NULL) {
+        printf("xxx use entry.\n");
     }
 
     // If it wasn't in the dictionary, try to run it through numbers.
@@ -1387,12 +1511,51 @@ __mill_do_read(Mill* self)
     }
 }
 
+void
+mill_input(Mill* self, Bw* bw) 
+{
+    void enqueue() {
+        Bb* bb = bb_fifo_pull(self->bb_fifo_in_pool);
+        if (bb == NULL) {
+            // xxx modify later to support Slip behaviour.
+            printf("WARNING: input pool was empty, crash coming.\n");
+        }
+
+        bw_trim_right(bw);
+        bb_from_bw(bb, bw);
+        bb_fifo_push(self->bb_fifo_in, bb);
+    }
+
+    switch (self->mode) {
+    case MILL_MODE_REST:
+        __mill_to_mode_read(self);
+    case MILL_MODE_WEIR:
+    case MILL_MODE_WORK:
+    case MILL_MODE_READ:
+        enqueue();
+    case MILL_MODE_SLIP:
+        break;
+    }
+}
+
 // Tells us whether the mill has input waiting, or work to do.
 uint8_t
 mill_is_active() 
 {
     printf("xxx mill_active\n"); // xxx
     return 1; // xxx
+}
+
+int
+mill_is_input_ready(Mill* self) 
+{
+    return bb_fifo_size(self->bb_fifo_in_pool);
+}
+
+char
+mill_is_quitting(Mill* self) 
+{
+    return self->b_quit;
 }
 
 // Returns any unused gas
@@ -1422,90 +1585,11 @@ mill_power(Mill* self, unsigned gas)
     return gas;
 }
 
-char
-mill_is_quitting(Mill* self) 
-{
-    return self->b_quit;
-}
-
-int
-mill_is_input_ready(Mill* self) 
-{
-    return bb_fifo_size(self->bb_fifo_in_pool);
-}
-
-void
-mill_input(Mill* self, Bw* bw) 
-{
-    void enqueue() {
-        Bb* bb = bb_fifo_pull(self->bb_fifo_in_pool);
-        if (bb == NULL) {
-            // xxx modify later to support Slip behaviour.
-            printf("WARNING: input pool was empty, crash coming.\n");
-        }
-
-        bw_trim_right(bw);
-        bb_from_bw(bb, bw);
-        bb_fifo_push(self->bb_fifo_in, bb);
-    }
-
-    switch (self->mode) {
-    case MILL_MODE_REST:
-        __mill_to_mode_read(self);
-    case MILL_MODE_WEIR:
-    case MILL_MODE_WORK:
-    case MILL_MODE_READ:
-        enqueue();
-    case MILL_MODE_SLIP:
-        break;
-    }
-}
-
-void
-mill_install_standard_dict(Mill* self) 
-{
-    // standard word definitions
-    Bw bw;
-    bw_from_s(&bw, ": double dup + ;");
-    mill_input(self, &bw);
-}
-
 static char*
 mill_test() 
 {
-    {
-        printf("*** mill_test() 000 **************\n");
-        Mill* self = NULL;
-        Bw* bw = NULL; {
-            // Mill: this is what we are testing
-            size_t dict_size = (1024*1024) * 40;
-            size_t word_size = 16;
-            size_t fifo_in_size = 16;
-            size_t fifo_out_size = 16;
-            self = mill_new(dict_size, word_size, fifo_in_size, fifo_out_size);
-
-            // Bw: We use this to pass instructions to the mill.
-            bw = bw_new();
-        }
-
-        { // use the echo mode to test input and output
-            char* s;
-            s = ".echo aa bb cc\n"; bw_set(bw, s+0, s+5);
-
-            mill_input(self, bw);
-
-            unsigned gas = 10;
-            gas = mill_power(self, gas);
-            printf("Remaining gas %d\n", gas); // xxx
-        }
-
-        // cleanup
-        bw_del(bw);
-        mill_del(self);
-    }
-
-    {
-        printf("*** mill_test() 001 parse int ****\n");
+    { // parse int
+        printf("*** mill_test  parse int *********\n");
         Mill* self = NULL;
         Bw* bw = NULL; {
             size_t dict_size = (1024*1024) * 40;
@@ -1556,6 +1640,71 @@ mill_test()
         bw_from_s(bw, "000"); // Leading zeros are valid.
         rcode = __mill_numbers_parse_int(self, bw, &acc);
         mu_assert(rcode == 1, "rcode wrong");
+
+        // cleanup
+        bw_del(bw);
+        mill_del(self);
+    }
+
+    { // dictionary basics
+        printf("\n\n^^ dictionary basics\n"); // xxx
+        Bw* bw = bw_new();
+        Mill* self = NULL; {
+            size_t dict_size = (1024*1024) * 40;
+            size_t word_size = 16;
+            size_t fifo_in_size = 16;
+            size_t fifo_out_size = 16;
+            self = mill_new(dict_size, word_size, fifo_in_size, fifo_out_size);
+        }
+        mu_assert(((Entry*) self->dict_top)->entry_h == 0, "entry h")
+
+        mill_dict_register_cfunc(self, "dup", cfunc_dup);
+        mu_assert(((Entry*) self->dict_top)->entry_h == 1, "entry h")
+
+        mill_dict_register_forth(self, "2dup", "dup dup");
+        mu_assert(((Entry*) self->dict_top)->entry_h == 2, "entry h")
+
+        Entry* entry;
+
+        bw_from_s(bw, "unknown_word");
+        entry = mill_dict_search(self, bw);
+        mu_assert(entry == NULL, ".");
+
+        bw_from_s(bw, "dup");
+        entry = mill_dict_search(self, bw);
+        mu_assert(entry != NULL, ".");
+
+        printf("xxx test for dictionary basics\n");
+
+        bw_del(bw);
+        mill_del(self);
+    }
+
+    { // define a new word
+        printf("*** mill_test define new word ****\n");
+        Mill* self = NULL;
+        Bw* bw = NULL; {
+            // Mill: this is what we are testing
+            size_t dict_size = (1024*1024) * 40;
+            size_t word_size = 16;
+            size_t fifo_in_size = 16;
+            size_t fifo_out_size = 16;
+            self = mill_new(dict_size, word_size, fifo_in_size, fifo_out_size);
+
+            // Bw: We use this to pass instructions to the mill.
+            bw = bw_new();
+        }
+
+        { // use the echo mode to test input and output
+            char* s;
+            s = ".echo aa bb cc\n"; bw_set(bw, s+0, s+5);
+
+            mill_input(self, bw);
+
+            unsigned gas = 10;
+            gas = mill_power(self, gas);
+            printf("Remaining gas %d\n", gas); // xxx
+        }
 
         // cleanup
         bw_del(bw);
@@ -1618,7 +1767,7 @@ alg()
     printf("aaa\n");
 
     Mill* mill = mill_new(dict_size, word_size, fifo_in_size, fifo_out_size); {
-        mill_install_standard_dict(mill);
+        mill_dict_register_defaults(mill);
 
         printf(".\n");
         repl(mill);
@@ -1629,8 +1778,8 @@ alg()
 //
 // Only one line should be enabled here.
 //
-RUN_TESTS(all_tests);
-//int main() { token_stack_test(); return 0; }
+//RUN_TESTS(all_tests);
+int main() { mill_test(); return 0; }
 
 //int main() { alg(); return 0; }
 

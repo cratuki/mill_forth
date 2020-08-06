@@ -20,7 +20,7 @@ void util_hexdump(uint8_t* mem, size_t n)
         printf("%02x", *c);
 
         if (i%16 == 15) {
-            printf("\n| ");
+            printf("\nhex | ");
         }
         else if (i%8 == 7) {
             printf("  ");
@@ -76,7 +76,7 @@ typedef struct bw_t {
 
 typedef struct bw_stack_t {
     struct bw_t*    top;
-    unsigned        n;      // SiZe
+    unsigned        n;      // Size
 } BwStack;
 
 
@@ -120,7 +120,7 @@ typedef struct token_stack_t {
 } TokenStack;
 
 /*
- * Mode transitions. Each transition is bidirectional,
+ * Mode transitions. Each transition is bidirectional, except to quit.
  *
  *      Weir      Read
  *          \    /    \
@@ -140,8 +140,8 @@ enum mill_mode_t {
     MILL_MODE_SLIP, // When there is an error to be collected.
 };
 
-
 enum parser_t {
+    PARSER_ECHO,    // xxx Remove this parser as the system stablises.
     PARSER_NORMAL,
     PARSER_STRING,
 };
@@ -151,28 +151,29 @@ typedef struct mill_t {
     enum parser_t       parser;
 
     char                b_quit;
-    char                b_echo;
-                      
+
     void*               dict_mem;
     void*               dict_top;
 
     Bb*                 bb_buf_input;
+        // Src: bb_fifo_in       Dst: MILL_MODE_WORK
     Bb*                 bb_buf_output;
+        // Src: MILL_MODE_WORK   Dst: bb_fifo_out
 
     BbFifo*             bb_fifo_in_pool;
     BbFifo*             bb_fifo_in;
-        // Stuff that is waiting to become bb_buf_input
+        // Words that are waiting to become bb_buf_input.
 
     BbFifo*             bb_fifo_out_pool;
     BbFifo*             bb_fifo_out;
-        // Stuff that has been sent for output (via bb_buf_output) but
-        // not yet collected by whatever is enclosing the mill.
+        // Words that the composer is yet to collect.
 
     BwStack*            bw_stack_work;
     BwStack*            bw_stack_pool;
         // Queued-up work
 
-    TokenStack*         token_stack;
+    TokenStack*         token_stack_live;
+    TokenStack*         token_stack_pool;
         // This is the algorithmic forth stack.
 } Mill;
 
@@ -220,16 +221,16 @@ bb_del(Bb* self)
     util_free(self);
 }
 
+size_t
+bb_capacity(Bb* self)
+{
+    return self->n;
+}
+
 void
 bb_clear(Bb* self) 
 {
     self->l = 0;
-}
-
-size_t
-bb_size(Bb* self) 
-{
-    return self->l;
 }
 
 void
@@ -252,26 +253,32 @@ bb_debug_hex(Bb* self)
     util_hexdump(s, self->l);
 }
 
+size_t
+bb_length(Bb* self) 
+{
+    return self->l;
+}
+
 void
-bb_place(Bb* self, char* src, unsigned src_nail, unsigned src_peri) 
+bb_place_to(Bb* self, char* src, unsigned dst_offset, unsigned src_offset_nail, unsigned src_offset_peri)
 {
     // We can improve on this once we have implemented SLIP.
-    if (src_peri - src_nail > self->n) {
+    if (src_offset_peri - src_offset_nail > self->n) {
         printf("WARNING: crash coming, string too long for bb.\n");
     }
 
-    if (src_peri <= src_nail) {
+    if (src_offset_peri <= src_offset_nail) {
         self->l = 0;
         return;
     }
 
-    if (src_peri - src_nail > self->n) {
-        src_peri = self->n - src_peri;
+    if (src_offset_peri - src_offset_nail > self->n) {
+        src_offset_peri = self->n - src_offset_peri;
     }
 
     char* dst = self->s;
-    int n = 0;
-    for (int i=src_nail; i<src_peri; i++) {
+    int n = dst_offset;
+    for (int i=src_offset_nail; i<src_offset_peri; i++) {
         *(dst+n) = *(src+i);
         n++;
     }
@@ -280,11 +287,26 @@ bb_place(Bb* self, char* src, unsigned src_nail, unsigned src_peri)
 }
 
 void
+bb_place(Bb* self, char* src, unsigned src_offset_nail, unsigned src_offset_peri) 
+{
+    bb_place_to(self, src, 0, src_offset_nail, src_offset_peri);
+}
+
+void
 bb_from_s(Bb* self, char* src) 
 {
-    unsigned src_nail = 0;
-    unsigned src_peri = strlen(src);
-    bb_place(self, src, src_nail, src_peri);
+    unsigned src_offset_nail = 0;
+    unsigned src_offset_peri = strlen(src);
+    bb_place(self, src, src_offset_nail, src_offset_peri);
+}
+
+void
+bb_from_s_append(Bb* self, char* src) 
+{
+    unsigned src_offset_nail = 0;
+    unsigned src_offset_peri = strlen(src);
+    unsigned dst_offset = self->l;
+    bb_place_to(self, src, dst_offset, src_offset_nail, src_offset_peri);
 }
 
 void
@@ -304,7 +326,7 @@ bb_from_bw(Bb* self, Bw* bw)
 {
     int len = bw->peri - bw->nail;
     if (len > self->n) {
-        printf("WARNING: crash coming. Bw string too long for Bb.\n");
+        printf("Crash coming. Bw too long %d for Bb %zu.\n", len, self->n);
     }
 
     char* w = bw->nail;
@@ -315,17 +337,37 @@ bb_from_bw(Bb* self, Bw* bw)
 }
 
 void
+bb_from_bw_append(Bb* self, Bw* bw) 
+{
+    int dst_offset = self->l;
+
+    int len = bw->peri - bw->nail;
+    if (len > self->n) {
+        printf("Crash coming. Bw too long %d for Bb %zu.\n", len, self->n);
+    }
+
+    char* w = bw->nail;
+    for (int i=0; i<len; i++) {
+        *(self->s+dst_offset+i) = *w++;
+    }
+    self->l = bw->peri - bw->nail;
+}
+
+void
 bb_to_s(Bb* self, char* s) 
 {
     char* src_ptr = self->s;
     char* dst_ptr = s;
-    while( (*dst_ptr++ = *src_ptr++) );
-    *s = 0;
+    size_t len = bb_length(self);
+    for (int i=0; i<len; i++) {
+        *dst_ptr++ = *src_ptr++;
+    }
+    *dst_ptr = 0;
 }
 
 // Returns 1 if equiv, 0 otherwise.
 int
-bb_equals(Bb* self, char* s) 
+bb_equals_s(Bb* self, char* s) 
 {
     int len = strlen(s);
     if (self->l != len) {
@@ -359,9 +401,38 @@ bb_test()
     Bb* bb_a = bb_new(40);
     Bb* bb_b = bb_new(40);
 
-    char* s = "a bb ccc   dddd  e  ff g hh i";
-    bb_place(bb_a, s, 0, strlen(s));
-    mu_assert(bb_equals(bb_a, s), ".");
+    { // bb_from_s; bb_length; bb_clear
+        bb_from_s(bb_a, "abc");
+        mu_assert(bb_length(bb_a) == 3, ".");
+
+        bb_clear(bb_a);
+        mu_assert(bb_length(bb_a) == 0, ".");
+    } bb_clear(bb_a);
+      bb_clear(bb_b);
+
+    { // bb_place basic; bb_to_s;
+        char* s = "a bb ccc   dddd  e  ff g hh i";
+        bb_place(bb_a, s, 0, strlen(s));
+        mu_assert(bb_equals_s(bb_a, s), ".");
+
+        char* dst = (char*) malloc(400);
+        bb_to_s(bb_a, dst);
+        mu_assert(strcmp(s, dst) == 0, "strcmp");
+        free(dst);
+    } bb_clear(bb_a);
+      bb_clear(bb_b);
+
+    { // bb_place; bb_clear; bb_append
+        bb_from_s(bb_a, "jkl");
+        bb_from_s_append(bb_a, "mnop");
+
+        char* s = "jklmnop";
+        char* dst = (char*) malloc(400);
+        bb_to_s(bb_a, dst);
+        mu_assert(strcmp(s, dst) == 0, "strcmp");
+        free(dst);
+    } bb_clear(bb_a);
+      bb_clear(bb_b);
 
     bb_del(bb_b);
     bb_del(bb_a);
@@ -623,8 +694,24 @@ void
 bw_debug(Bw* self) 
 {
     printf("{Bw %p %p %lu {\n", self->nail, self->peri, self->peri-self->nail);
+
+    printf("|");
+    for (int i=0; i < (int) (self->peri - self->nail); i++) {
+        printf("%c", *(self->nail+i));
+    }
+    printf("|\n");
+
+    printf("}Bw\n");
+}
+
+void
+bw_debug_hex(Bw* self) 
+{
+    printf("{Bw (hex) %p %p %lu {\n", self->nail, self->peri, self->peri-self->nail);
+
     uint8_t* s = (uint8_t*) self->nail;
     util_hexdump(s, self->peri-self->nail);
+
     printf("}Bw\n");
 }
 
@@ -652,7 +739,7 @@ bw_equals_s(Bw* self, char* s)
     }
 
     char* t = self->nail;
-    while (t < self->peri) {
+    for (int i=0; i<len; i++) {
         if (*t++ != *s++) {
             return 0;
         }
@@ -717,18 +804,28 @@ void
 bw_trim_left(Bw* self) 
 {
     while (self->nail < self->peri) {
-        if (*self->nail != ' ') break;
-        self->nail++;
+        if (*self->nail == ' ' || *self->nail == '\n') {
+            self->nail++;
+        }
+        else {
+            break;
+        }
     }
 }
 
 void
 bw_trim_right(Bw* self) 
 {
-    while (self->nail < self->peri) {
-        if (*self->peri != ' ') break;
-        self->peri--;
+    char* last = self->peri - 1;
+    while (self->nail <= last) {
+        if (*last == ' ' || *last == '\n') {
+            last--;
+        }
+        else {
+            break;
+        }
     }
+    self->peri = last + 1;
 }
 
 static char*
@@ -736,10 +833,12 @@ bw_test()
 {
     Bw* bw = bw_new(); {
         { // bw_trim_left
-            char* s = "  aaa";
+            char* s = "  aaa \n";
             bw_set(bw, s, s+strlen(s));
-            mu_assert(bw_size(bw) == 5, ".");
+            mu_assert(bw_size(bw) == 7, ".");
             bw_trim_left(bw);
+            mu_assert(bw_size(bw) == 5, ".");
+            bw_trim_right(bw);
             mu_assert(bw_size(bw) == 3, ".");
         }
 
@@ -786,6 +885,15 @@ bw_test()
 // ------------------------------------------------------------------------
 //  bw stack
 // ------------------------------------------------------------------------
+Bw*
+bw_stack_pop(BwStack* self);
+
+void
+bw_stack_push(BwStack* self, Bw* bw);
+
+size_t
+bw_stack_size(BwStack* self);
+
 static void
 __bw_stack_init(BwStack* self) 
 {
@@ -818,40 +926,6 @@ bw_stack_del(BwStack* self)
     util_free(self);
 }
 
-size_t
-bw_stack_size(BwStack* self) 
-{
-    return self->n;
-}
-
-void
-bw_stack_push(BwStack* self, Bw* bw) 
-{
-    bw->prev = self->top;
-    self->top = bw;
-    self->n++;
-}
-
-Bw*
-bw_stack_top(BwStack* self) 
-{
-    return self->top;
-}
-
-Bw*
-bw_stack_pop(BwStack* self) 
-{
-    Bw* bw = NULL;
-    if (self->n) {
-        bw = self->top;
-        self->top = bw->prev;
-        bw->prev = NULL;
-
-        self->n--;
-    }
-    return bw;
-}
-
 // This attempts to pop from the supplied stack. If none are available,
 // it creates a new instance.
 Bw*
@@ -871,6 +945,40 @@ bw_stack_move(BwStack* self, BwStack* dst)
 {
     Bw* bw = bw_stack_pop(self);
     bw_stack_push(dst, bw);
+}
+
+Bw*
+bw_stack_pop(BwStack* self) 
+{
+    Bw* bw = NULL;
+    if (self->n) {
+        bw = self->top;
+        self->top = bw->prev;
+        bw->prev = NULL;
+
+        self->n--;
+    }
+    return bw;
+}
+
+void
+bw_stack_push(BwStack* self, Bw* bw) 
+{
+    bw->prev = self->top;
+    self->top = bw;
+    self->n++;
+}
+
+size_t
+bw_stack_size(BwStack* self) 
+{
+    return self->n;
+}
+
+Bw*
+bw_stack_top(BwStack* self) 
+{
+    return self->top;
 }
 
 static char*
@@ -992,14 +1100,14 @@ token_test()
 //  token stack
 // ------------------------------------------------------------------------
 static void
-__token_stack_init(TokenStack* self)
+token_stack_init(TokenStack* self)
 {
     self->top = NULL;
     self->n = 0;
 }
 
 static void
-__token_stack_exit(TokenStack* self)
+token_stack_exit(TokenStack* self)
 {
     while (self->top != NULL) {
         Token* token = self->top;
@@ -1012,24 +1120,28 @@ static TokenStack*
 token_stack_new()
 {
     TokenStack* self = (TokenStack*) malloc(sizeof(TokenStack));
-    __token_stack_init(self);
+    token_stack_init(self);
     return self;
 }
 
 void
 token_stack_del(TokenStack* self)
 {
-    __token_stack_exit(self);
+    token_stack_exit(self);
     util_free(self);
 }
 
 Token*
-token_stack_pop(TokenStack* self)
+token_stack_pop(TokenStack* self, TokenType token_type)
 {
     Token* token = self->top;
     self->top = token->prev;
+
+    token->token_type = token_type;
     token->prev = NULL;
+
     self->n--;
+
     return token;
 }
 
@@ -1053,6 +1165,18 @@ token_stack_top(TokenStack* self)
     return self->top;
 }
 
+// Source from pool or create.
+Token*
+token_stack_get(TokenStack* self, TokenType token_type)
+{
+    if (token_stack_size(self)) {
+        return token_stack_pop(self, token_type);
+    }
+    else {
+        return token_new(token_type);
+    }
+}
+
 static char*
 token_stack_test()
 {
@@ -1073,11 +1197,11 @@ token_stack_test()
 
     Token* w;
     
-    w = token_stack_pop(token_stack);
+    w = token_stack_pop(token_stack, TOKEN_TYPE_INT);
     mu_assert(w == token_b, "pop");
     mu_assert(token_stack_size(token_stack) == 1, "size");
 
-    w = token_stack_pop(token_stack);
+    w = token_stack_pop(token_stack, TOKEN_TYPE_INT);
     mu_assert(w == token_a, "pop");
     mu_assert(token_stack_size(token_stack) == 0, "size");
 
@@ -1096,6 +1220,10 @@ void cfunc_first(Mill* self) {}
 
 void cfunc_dot_s(Mill* self) {
     
+}
+
+void cfunc_empty(Mill* self) {
+    printf("xxx cfunc_empty\n");
 }
 
 void cfunc_dup(Mill* self) {
@@ -1117,7 +1245,7 @@ void
 mill_dict_register_cfunc(Mill* self, char* ename, Cfunc cfunc);
 
 static void
-__mill_init(Mill* self, size_t dict_size, size_t word_size,
+mill_init(Mill* self, size_t dict_size, size_t word_size,
         size_t fifo_in_size, size_t fifo_out_size) 
 {
     /* dict_size: number of bytes available to the dictionary.
@@ -1130,7 +1258,6 @@ __mill_init(Mill* self, size_t dict_size, size_t word_size,
     self->parser = PARSER_NORMAL;
 
     self->b_quit = 0;
-    self->b_echo = 1;
 
     self->dict_mem = (uint8_t*) malloc(sizeof(uint8_t) * dict_size);
     self->dict_top = self->dict_mem; {
@@ -1168,7 +1295,8 @@ __mill_init(Mill* self, size_t dict_size, size_t word_size,
     self->bw_stack_work = bw_stack_new();
     self->bw_stack_pool = bw_stack_new();
 
-    self->token_stack = token_stack_new();
+    self->token_stack_live = token_stack_new();
+    self->token_stack_pool = token_stack_new();
 }
 
 static void __mill_exit(Mill* self) 
@@ -1188,14 +1316,15 @@ static void __mill_exit(Mill* self)
     bw_stack_del(self->bw_stack_work);
     bw_stack_del(self->bw_stack_pool);
 
-    token_stack_del(self->token_stack);
+    token_stack_del(self->token_stack_live);
+    token_stack_del(self->token_stack_pool);
 }
 
 Mill* mill_new(size_t dict_size, size_t word_size, size_t fifo_in_size,
         size_t fifo_out_size) 
 {
     Mill* mill = (Mill*) malloc(sizeof(Mill));
-    __mill_init(mill, dict_size, word_size, fifo_in_size, fifo_out_size);
+    mill_init(mill, dict_size, word_size, fifo_in_size, fifo_out_size);
     return mill;
 }
 
@@ -1228,17 +1357,27 @@ void mill_debug(Mill* self)
     printf("}\n");
 }
 
-Entry*
-mill_dict_get_next_entry(Mill* mill, uint16_t entry_type)
+void
+mill_dict_debug(Mill* self)
 {
-    Entry* old_top = (Entry*) mill->dict_top;
+    Entry* ent = (Entry*) self->dict_top;
+    while (ent->entry_type != ENTRY_TYPE_FIRST) {
+        bw_debug(&ent->bw_name);
+        ent = ent->prev;
+    }
+}
+
+Entry*
+mill_dict_get_next_entry(Mill* self, uint16_t entry_type)
+{
+    Entry* old_top = (Entry*) self->dict_top;
 
     Entry* new_top = (Entry*) old_top->next;
     new_top->entry_h = old_top->entry_h + 1;
     new_top->entry_type = entry_type;
     new_top->prev = old_top;
 
-    mill->dict_top = (uint8_t*) new_top;
+    self->dict_top = (uint8_t*) new_top;
 
     return new_top;
 }
@@ -1304,17 +1443,40 @@ mill_dict_register_forth(Mill* self, char* ename, char* forth)
     entry->next = (uint8_t*) next;
 }
 
+size_t
+mill_dict_size(Mill* self)
+{
+    Entry* ent = (Entry*) self->dict_top;
+
+    // The first entry in the dict is burnt, and not counted.
+    size_t n = 0;
+    while (ent->entry_type != ENTRY_TYPE_FIRST) {
+        n++;
+        ent = ent->prev;
+    }
+
+    return n;
+}
+
 void
 mill_dict_register_defaults(Mill* self) 
 {
     Bw bw;
     Cfunc cfunc;
 
+    cfunc = cfunc_empty;
+    mill_dict_register_cfunc(self, "empty", cfunc);
+
     cfunc = cfunc_dup;
     mill_dict_register_cfunc(self, "dup", cfunc);
 
-    bw_from_s(&bw, ": double dup + ;");
-    mill_input(self, &bw);
+    // xxx
+    printf("xxx debug mill dict\n");
+    mill_dict_debug(self);
+    printf("xxx mill_dict_size %zu\n", mill_dict_size(self));
+
+    //bw_from_s(&bw, ": double dup + ;");
+    //mill_input(self, &bw);
 }
 
 Entry*
@@ -1331,33 +1493,44 @@ mill_dict_search(Mill* self, Bw* bw)
     return NULL;
 }
 
-static void __mill_to_mode_weir(Mill* self) 
+static int
+__mill_is_mode_weir(Mill* self)
 {
-    printf("To MILL_MODE_WEIR\n"); // xxx
+    return self->mode == MILL_MODE_WEIR;
+}
+
+static void
+__mill_to_mode_weir(Mill* self) 
+{
+    printf("    To MILL_MODE_WEIR\n"); // xxx
     self->mode = MILL_MODE_WEIR;
 }
 
-static void __mill_to_mode_work(Mill* self) 
+static void
+__mill_to_mode_work(Mill* self) 
 {
-    printf("To MILL_MODE_WORK\n"); // xxx
+    printf("    To MILL_MODE_WORK\n"); // xxx
     self->mode = MILL_MODE_WORK;
 }
 
-static void __mill_to_mode_read(Mill* self) 
+static void
+__mill_to_mode_read(Mill* self) 
 {
-    printf("To MILL_MODE_READ\n"); // xxx
+    printf("    To MILL_MODE_READ\n"); // xxx
     self->mode = MILL_MODE_READ;
 }
 
-static void __mill_to_mode_rest(Mill* self) 
+static void
+__mill_to_mode_rest(Mill* self) 
 {
-    printf("To MILL_MODE_REST\n"); // xxx
+    printf("    To MILL_MODE_REST\n"); // xxx
     self->mode = MILL_MODE_REST;
 }
 
-static void __mill_to_mode_slip(Mill* self) 
+static void
+__mill_to_mode_slip(Mill* self) 
 {
-    printf("To MILL_MODE_SLIP\n"); // xxx
+    printf("    To MILL_MODE_SLIP\n"); // xxx
     self->mode = MILL_MODE_SLIP;
 }
 
@@ -1406,75 +1579,212 @@ __mill_numbers_parse_int(Mill* self, Bw* bw, int* acc)
 }
 
 static void
-__mill_on_word(Mill* self, Bw* bw) 
+__mill_output_words(Mill* self)
 {
-    printf("xxx __mill_on_word\n");
+    // This will end up being similar to __mill_output_stack. Review.
+    printf("xxx untested\n");
 
-    // Control defines
-    if (bw_equals_s(bw, ".q")) {
-        self->b_quit = 1;
-        return;
-    }
-    if (bw_equals_s(bw, ".s")) {
-        printf("xxx print stack.\n");
-        return;
-    }
-    if (bw_equals_s(bw, ".echo")) {
-        self->b_echo = 1;
-        return;
-    }
-    if (bw_equals_s(bw, ".noecho")) {
-        self->b_echo = 0;
-        return;
-    }
+    Entry* ent = (Entry*) self->dict_mem;
+    Entry* top = (Entry*) self->dict_top;
 
-    // Attempt to find it in the dictionary
-    Entry* entry = mill_dict_search(self, bw);
-    if (entry != NULL) {
-        printf("xxx use entry.\n");
-    }
+    Bb* bb = self->bb_buf_output;
+    char* src = bb->s;
+    unsigned src_offset_nail;
+    unsigned src_offset_peri;
 
-    // If it wasn't in the dictionary, try to run it through numbers.
-    if (entry == NULL) {
-        int acc = 0;
-        uint8_t rcode;
-        
-        rcode = __mill_numbers_parse_int(self, bw, &acc);
+    unsigned n = 0;
+
+    Bw* bw_name;
+    while (ent <= top) {
+        bw_name = &ent->bw_name;
+
+        src = bw_name->nail;
+        src_offset_nail = 0;
+        src_offset_peri = src_offset_peri - src_offset_nail;
+
+        if (bb_length(bb) + src_offset_peri > bb_capacity(bb))
+            break;
+
+        bb_from_bw_append(bb, bw_name);
+
+        ent = (Entry*) ent->next;
     }
 }
 
+// xxx interesting. at the moment it outputs the stack in reverse order. is
+// this what we want? it implies that existing forth implementations implement
+// their stack differently than I have done. Not a huge surprise. Their stack
+// implementation will be closer to my dict implementation. I will probably
+// want to refactor towards that. It would be easier to reason about the
+// amount of memory that a system was using if I did this.
 static void
-__mill_process_one_word(Mill* self, Bw* bw) 
+__mill_output_stack(Mill* self)
+{
+    printf("xxx __mill_output_stack\n");
+
+    Entry* ent = (Entry*) self->dict_mem;
+    Entry* top = (Entry*) self->dict_top;
+
+    Bw* bw_name;
+    while (1) {
+        bb_from_bw_append(self->bb_buf_output, &ent->bw_name);
+        // xxx
+        printf("Adding\n");
+        bw_debug(&ent->bw_name);
+
+        if (ent->prev == NULL) {
+            break;
+        }
+        else {
+            ent = (Entry*) ent->prev;
+        }
+    }
+    bb_debug(self->bb_buf_output);
+}
+
+static void
+__mill_on_word(Mill* self, Bw* bw) 
+{
+    // Control scan
+    {
+        if (bw_equals_s(bw, ".\"")) {
+            self->parser = PARSER_STRING;
+            return;
+        }
+        if (bw_equals_s(bw, ".echo")) {
+            self->parser = PARSER_ECHO;
+            return;
+        }
+        if (bw_equals_s(bw, ".w")) {
+            __mill_output_words(self);
+            return;
+        }
+        if (bw_equals_s(bw, ".q") || bw_equals_s(bw, "bye")) {
+            printf("Quit marked.\n"); // xxx
+            self->b_quit = 1;
+            return;
+        }
+        if (bw_equals_s(bw, ".s")) {
+            __mill_output_stack(self);
+            return;
+        }
+    }
+
+    // Dictionary scan
+    {
+        Entry* entry = mill_dict_search(self, bw);
+        if (entry != NULL) {
+            printf("xxx use entry.\n");
+            return;
+        }
+    }
+
+    // Numbers scan
+    {
+        int n = 0;
+        uint8_t rcode;
+        
+        rcode = __mill_numbers_parse_int(self, bw, &n);
+        if (rcode) {
+            Token* token = token_stack_get(self->token_stack_pool,
+                    TOKEN_TYPE_INT);
+            token->n = n;
+            token_stack_push(self->token_stack_live, token);
+            return;
+        }
+    }
+
+    printf("xxx __mill_on_word Error.\n"); // xxx Go to MILL_MODE_SLIP.
+}
+
+static void
+__mill_parse_echo(Mill* self, Bw* bw)
 {
     // Allocate
-    Bw* word = bw_stack_get(self->bw_stack_pool);
-
+    Bw* bw_word = bw_stack_get(self->bw_stack_pool);
+    
     // Locate a single word
-    word->nail = bw->nail++;
-    word->peri = bw->nail;
+    bw_word->nail = bw->nail++;
+    bw_word->peri = bw->nail;
     while (bw->nail < bw->peri) {
         if (*bw->nail == ' ') break;
 
-        word->peri++;
+        bw_word->peri++;
+        bw->nail++;
+    }
+
+    // Send it to the output fifo (or end echo mode).
+    if (bw_equals_s(bw_word, ".")) {
+        self->parser = PARSER_NORMAL;
+    }
+    else {
+        bb_from_bw(self->bb_buf_output, bw_word);
+    }
+
+    // Cleanup
+    bw_stack_push(self->bw_stack_pool, bw_word);
+}
+
+static void
+__mill_parse_normal(Mill* self, Bw* bw) 
+{
+    // Allocate
+    Bw* bw_word = bw_stack_get(self->bw_stack_pool);
+
+    // Locate a single word
+    bw_word->nail = bw->nail++;
+    bw_word->peri = bw->nail;
+    while (bw->nail < bw->peri) {
+        if (*bw->nail == ' ') break;
+
+        bw_word->peri++;
         bw->nail++;
     }
 
     // Process it
-    __mill_on_word(self, bw);
+    __mill_on_word(self, bw_word);
 
     // Cleanup
-    bw_stack_push(self->bw_stack_pool, word);
+    bw_stack_push(self->bw_stack_pool, bw_word);
+}
+
+static void
+__mill_parse_string(Mill* self, Bw* bw) 
+{
+    printf("xxx string parsing is not yet implemented.\n");
+    exit(1);
 }
 
 static void
 __mill_do_work(Mill* self) 
 {
+    // If there is no work left to do, retreat to read mode.
+    if (bw_stack_size(self->bw_stack_work) == 0) {
+        __mill_to_mode_read(self);
+        return;
+    }
+
+    // The top Bw in the stack may contain several textual words. Hence, we do
+    // not pop here, but get a pointer to top.
     Bw* bw = bw_stack_top(self->bw_stack_work);
     bw_trim_left(bw);
     if (bw_size(bw)) {
-        __mill_process_one_word(self, bw);
+        switch (self->parser) {
+        case PARSER_ECHO:
+            __mill_parse_echo(self, bw);
+            break;
+        case PARSER_NORMAL:
+            __mill_parse_normal(self, bw);
+            break;
+        case PARSER_STRING:
+            __mill_parse_string(self, bw);
+            break;
+        }
     }
-    else {
+
+    // If the Bw is empty (perhaps as a result of the work above, or perhaps
+    // because it was empty to start with), we return it to the pool.
+    if (!bw_size(bw)) {
         bw_stack_move(self->bw_stack_work, self->bw_stack_pool);
     }
 
@@ -1549,7 +1859,15 @@ mill_is_active()
 int
 mill_is_input_ready(Mill* self) 
 {
-    return bb_fifo_size(self->bb_fifo_in_pool);
+    // We can accept input in most occasions, but not when the
+    // input pool has run out of entries.
+    return (int) bb_fifo_size(self->bb_fifo_in_pool);
+}
+
+int
+mill_is_output_ready(Mill* self)
+{
+    return (int) bb_fifo_size(self->bb_fifo_out);
 }
 
 char
@@ -1558,15 +1876,42 @@ mill_is_quitting(Mill* self)
     return self->b_quit;
 }
 
+void
+mill_output(Mill* self, Bb* bb)
+{
+    Bb* bb_content = bb_fifo_pull(self->bb_fifo_out);
+    if (bb == NULL) {
+        // xxx
+        printf("WARNING: no output ready. Crash expected.\n");
+    }
+
+    printf("&&& %d %d\n", bb==NULL, bb_content==NULL); // xxx
+    bb_from_bb(bb, bb_content);
+
+    bb_fifo_push(self->bb_fifo_out_pool, bb_content);
+
+    switch (self->mode) {
+    case MILL_MODE_REST:
+    case MILL_MODE_WORK:
+    case MILL_MODE_READ:
+    case MILL_MODE_SLIP:
+        break;
+    case MILL_MODE_WEIR:
+        __mill_to_mode_work(self);
+        break;
+    }
+}
+
 // Returns any unused gas
 unsigned
 mill_power(Mill* self, unsigned gas) 
 {
     int b_continue = 1;
-    while (b_continue && gas) {
+    while (gas) {
         switch (self->mode) {
         case MILL_MODE_WEIR:
-            b_continue = 0;
+            // The block below that handles output data handles this Weir
+            // state.
             break;
         case MILL_MODE_WORK:
             __mill_do_work(self);
@@ -1580,7 +1925,36 @@ mill_power(Mill* self, unsigned gas)
             break;
         }
 
-        gas--;
+        // If there is output to be sent towards the user, attempt this.
+        //
+        // xxx Modify this to do one token at a time. This is going to involve
+        // quite a bit of refactoring to allow elegant handling of string
+        // output and the like. A good scenario to focus on is handling output
+        // from .s.
+        if (bb_length(self->bb_buf_output)) {
+            if (bb_fifo_size(self->bb_fifo_out_pool)) {
+                Bb* bb = bb_fifo_pull(self->bb_fifo_out_pool);
+                bb_from_bb(bb, self->bb_buf_output);
+                bb_clear(self->bb_buf_output);
+                bb_fifo_push(self->bb_fifo_out, bb);
+
+                // Where we are in Weir, this falls us back to Work.
+                __mill_to_mode_work(self);
+                b_continue = 1;
+            }
+            else {
+                // If there is nowhere for us to send this data at the moment, make
+                // sure we are in weir, and return early.
+                __mill_to_mode_weir(self);
+                b_continue = 0;
+            }
+        }
+
+        if (b_continue) {
+            gas--;
+        } else {
+            break;
+        }
     }
     return gas;
 }
@@ -1588,8 +1962,8 @@ mill_power(Mill* self, unsigned gas)
 static char*
 mill_test() 
 {
-    { // parse int
-        printf("*** mill_test  parse int *********\n");
+    { // int parsing function
+        printf("*** mill_test int parsing function *******\n");
         Mill* self = NULL;
         Bw* bw = NULL; {
             size_t dict_size = (1024*1024) * 40;
@@ -1646,8 +2020,27 @@ mill_test()
         mill_del(self);
     }
 
+    { // placing and removing ints (on/from the stack)
+        printf("*** put an int on the stack **********\n"); // xxx
+        Bw* bw = bw_new();
+        Mill* self = NULL; {
+            size_t dict_size = (1024*1024) * 40;
+            size_t word_size = 16;
+            size_t fifo_in_size = 16;
+            size_t fifo_out_size = 16;
+            self = mill_new(dict_size, word_size, fifo_in_size, fifo_out_size);
+        }
+        
+        bw_from_s(bw, "450");
+        mill_input(self, bw);
+
+        // cleanup
+        bw_del(bw);
+        mill_del(self);
+    }
+
     { // dictionary basics
-        printf("\n\n^^ dictionary basics\n"); // xxx
+        printf("*** dictionary basics ****************\n"); // xxx
         Bw* bw = bw_new();
         Mill* self = NULL; {
             size_t dict_size = (1024*1024) * 40;
@@ -1683,7 +2076,8 @@ mill_test()
     { // define a new word
         printf("*** mill_test define new word ****\n");
         Mill* self = NULL;
-        Bw* bw = NULL; {
+        Bw* bw = NULL;
+        Bb* bb = NULL; {
             // Mill: this is what we are testing
             size_t dict_size = (1024*1024) * 40;
             size_t word_size = 16;
@@ -1691,22 +2085,42 @@ mill_test()
             size_t fifo_out_size = 16;
             self = mill_new(dict_size, word_size, fifo_in_size, fifo_out_size);
 
-            // Bw: We use this to pass instructions to the mill.
             bw = bw_new();
+
+            bb = bb_new(400);
         }
 
-        { // use the echo mode to test input and output
-            char* s;
-            s = ".echo aa bb cc\n"; bw_set(bw, s+0, s+5);
+        unsigned gas;
 
-            mill_input(self, bw);
+        /* xxx working point
+        bw_from_s(bw, ": star 42 emit ;");
+        mill_input(self, bw);
+        gas = 10;
+        mill_power(self, gas);
+        mu_assert(mill_is_output_ready(self) == 1, "Mill output?");
 
-            unsigned gas = 10;
-            gas = mill_power(self, gas);
-            printf("Remaining gas %d\n", gas); // xxx
+        printf("xxx check output is 'ok'\n"); {
+            bb_clear(bb);
+            mill_output(self, bb);
+            printf("xxx incomplete\n");
         }
+        */
+
+        bw_from_s(bw, "star");
+        mill_input(self, bw);
+        gas = 10;
+        mill_power(self, gas);
+        printf("xxx check output is '**********'\n");
+
+        printf("--------------------------------------------------------\n");
+        bw_from_s(bw, ".s");
+        mill_input(self, bw);
+        gas = 10;
+        mill_power(self, gas);
+        printf("--------------------------------------------------------\n");
 
         // cleanup
+        bb_del(bb);
         bw_del(bw);
         mill_del(self);
     }
@@ -1720,6 +2134,72 @@ mill_test()
 // ------------------------------------------------------------------------
 //  alg
 // ------------------------------------------------------------------------
+#define REPL_LOOP_BUFFER_SIZE 4096
+void
+repl(Mill* mill) 
+{
+    Bb* bb_input = bb_new(30);
+    Bw* bw = bw_new(); {
+        char buf[REPL_LOOP_BUFFER_SIZE];
+        size_t n;
+        while (!mill_is_quitting(mill)) { // repl loop
+            fgets((char*) buf, REPL_LOOP_BUFFER_SIZE-1, stdin);
+            bw_from_s(bw, buf);
+            mill_input(mill, bw);
+
+            // Keep doing stuff until we have a cycle where we consume no
+            // gas. At that point, give the repl back to the user.
+            unsigned gas_per_loop = 10;
+            unsigned gas;
+            while (!mill_is_quitting(mill)) {
+                gas = gas_per_loop;
+                gas = mill_power(mill, gas);
+
+                // Get as much output as possible back to the user.
+                unsigned b_first_in_line = 1;
+                while (!mill_is_quitting(mill) && mill_is_output_ready(mill)) {
+                    Bb* bb_out = bb_fifo_pull(mill->bb_fifo_out);
+
+                    int len = bb_length(bb_out);
+                    char* s = (char*) malloc(len+1); {
+                        bb_to_s(bb_out, s);
+                        if (b_first_in_line) {
+                            b_first_in_line = 0;
+                            printf("//");
+                        }
+                        printf(" %s", s);
+                    }
+                    free(s);
+                }
+
+                if (gas == gas_per_loop) {
+                    printf("\n"); // x
+                    break;
+                }
+            }
+        }
+    }
+    bw_del(bw);
+    bb_del(bb_input);
+}
+
+void
+alg() 
+{
+    size_t dict_size = (1024*1024) * 40;
+    size_t word_size = 64;
+    size_t fifo_in_size = 4;
+    size_t fifo_out_size = 16;
+
+    Mill* mill = mill_new(dict_size, word_size, fifo_in_size, fifo_out_size); {
+        mill_dict_register_defaults(mill);
+
+        printf(".\n");
+        repl(mill);
+    }
+    mill_del(mill);
+}
+
 char*
 all_tests() 
 {
@@ -1736,50 +2216,11 @@ all_tests()
     return NULL;
 }
 
-#define REPL_LOOP_BUFFER_SIZE 4096
-void
-repl(Mill* mill) 
-{
-    // allocate bb to represent a repl line
-    Bb* bb_input = bb_new(30); {
-        char buf[REPL_LOOP_BUFFER_SIZE];
-        size_t n;
-        while (!mill_is_quitting(mill)) {
-            fgets((char*) buf, REPL_LOOP_BUFFER_SIZE-1, stdin);
-
-            n = strlen((char*) buf) - 1; // eliminates the newline
-            bb_place(bb_input, &buf[0], 0, n);
-
-            //__mill_parse(mill, bb_input);
-        }
-    }
-    bb_del(bb_input);
-}
-
-void
-alg() 
-{
-    size_t dict_size = (1024*1024) * 40;
-    size_t word_size = 16;
-    size_t fifo_in_size = 16;
-    size_t fifo_out_size = 16;
-
-    printf("aaa\n");
-
-    Mill* mill = mill_new(dict_size, word_size, fifo_in_size, fifo_out_size); {
-        mill_dict_register_defaults(mill);
-
-        printf(".\n");
-        repl(mill);
-    }
-    mill_del(mill);
-}
-
 //
 // Only one line should be enabled here.
 //
-//RUN_TESTS(all_tests);
-int main() { mill_test(); return 0; }
+RUN_TESTS(all_tests);
+//int main() { mill_test(); return 0; }
 
 //int main() { alg(); return 0; }
 

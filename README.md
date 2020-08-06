@@ -18,6 +18,15 @@ runs out of gas, and returns initiative to the enclosing system.
 
 As such, this system is designed to not be Turing-complete.
 
+Building this is a learning exercise, and it will contain design errors.
+
+
+# Design errors so far
+
+Implementation of the stack is done via pooling of malloc'd blocks. The design
+would be tighter if the stack used the same memory space as the dictionary.
+They could grow from different ends.
+
 
 # License (MIT)
 

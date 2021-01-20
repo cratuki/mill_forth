@@ -1,31 +1,33 @@
 # Status
 
-This is a work in progress. It should build, but is not yet far enough along
-to do anything as of writing.
+This project builds but has little functionality. It discredited its
+original hypothesis.
 
+The starting hypothesis,
 
-# Project description
+    That a gas-powered forth engine would be useful as a general-purpose
+    interpreter to be embedded in larger systems.
 
-A Mill Forth interpreter is composed within a larger system.
+The 'gas' concept serves the same role as Ethereum gas,
 
-There is a key concept, 'gas'.
+    The enclosing system periodically gives an amount of 'gas' to our
+    interpreter that is consumed as it runs.
+    
+    In this respect, the machine is technically not a turing machine, and
+    cannot get into infinite loops.
 
-That enclosing system periodically gives our interpreter an amount of 'gas'
-that can be regarded as fuel for running tasks.
+Through work, I formed a conclusion that there are better approaches to create
+a gas-powered interpreter. For example, a better approach would be to create a
+gas-powered virtual machine (either stack or register-based) and them to
+implement forth on top of that.
 
-The interpreter should never be stuck in an infinite loop. At some point, it
-runs out of gas, and returns initiative to the enclosing system.
+There was a further design error in the implementation of the stack here,
 
-As such, this system is designed to not be Turing-complete.
-
-Building this is a learning exercise, and it will contain design errors.
-
-
-# Design errors so far
-
-Implementation of the stack is done via pooling of malloc'd blocks. The design
-would be tighter if the stack used the same memory space as the dictionary.
-They could grow from different ends.
+    Implementation of the stack is done via pooling of malloc'd blocks.
+    
+    The design would be tighter if the stack used the same memory space as the
+    dictionary. Each could grow from different ends. Other forth systems use
+    this approach.
 
 
 # License (MIT)
